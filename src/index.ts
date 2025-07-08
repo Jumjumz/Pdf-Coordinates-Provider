@@ -1,6 +1,10 @@
-import * as fs from "fs";
+import { readFile, writeFileSync, existsSync } from "fs";
+import { promisify } from "util";
 import * as path from "path";
 import { Command } from "commander";
+import PDFParser from "pdf2json";
+
+const readFileAsync = promisify(readFile);
 
 interface CoordinateResult {
   field: string;
@@ -28,28 +32,36 @@ interface KeywordPattern {
 
 class PDFCoordinatesExtractor {
   private keywords: KeywordPattern[] = [];
-  private pdfjsLib: any;
 
   constructor() {}
 
-  private async loadPDFJS() {
-    if (!this.pdfjsLib)
-      this.pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
-
-    return this.pdfjsLib;
-  }
-
-  laodKeywords(patternFile: string): void {
-    if (!fs.existsSync(patternFile))
+  async loadKeywords(patternFile: string): Promise<void> {
+    if (!existsSync(patternFile))
       throw new Error(`Patterns file not found ${patternFile}`);
 
-    const content = fs.readFileSync(patternFile, "utf8");
+    const content = await readFileAsync(patternFile, "utf8");
     const data = JSON.parse(content);
 
     if (!data.keywords || !Array.isArray(data.keywords))
       throw new Error("Invalid keywords format");
 
     this.keywords = data.keywords;
+  }
+
+  private parsePDF(filePath: string): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const pdfParser = new PDFParser();
+
+      pdfParser.on("pdfParser_dataError", (errData: any) => {
+        reject(new Error(`PDF parsing error: ${errData.parserError}`));
+      });
+
+      pdfParser.on("pdfParser_dataReady", (pdfData: any) => {
+        resolve(pdfData);
+      });
+
+      pdfParser.loadPDF(filePath);
+    });
   }
 
   async extractCoordinates(
@@ -61,47 +73,45 @@ class PDFCoordinatesExtractor {
   ): Promise<CoordinateResult[]> {
     if (this.keywords.length === 0) throw new Error("No keywords loaded.");
 
-    const pdfjsLib = await this.loadPDFJS();
-    const dataBuffer = fs.readFileSync(pdfPath);
+    const pdfData = await this.parsePDF(pdfPath);
 
-    const loadTask = pdfjsLib.getDocument({
-      data: new Uint8Array(dataBuffer),
-      cMapUrl: "./node_modules/pdfjs-dist/cmaps/",
-      cMapPacked: true,
-      standardFontDataUrl: "./node_modules/pdfjs-dist/standard_fonts/",
-    });
+    if (!pdfData.Pages || pdfData.Pages.length === 0) {
+      throw new Error("No pages found in PDF");
+    }
 
-    const pdf = await loadTask.promise;
-    const pdfPage = await pdf.getPage(1);
-
-    const viewport = pdfPage.getViewport({ scale: 1.0 });
-
-    const scaleX = templateWidth / viewport.width;
-    const scaleY = templateHeight ? templateHeight / viewport.height : scaleX;
-
-    const textContent = await pdfPage.getTextContent();
+    const page = pdfData.Pages[0];
     const results: CoordinateResult[] = [];
 
-    for (const item of textContent.items) {
-      if ("str" in item) {
-        const text = item.str.trim();
+    const scaleX = templateWidth / page.Width;
+    const scaleY = templateHeight ? templateHeight / page.Height : scaleX;
 
-        for (const kwMap of this.keywords) {
-          if (text.toLowerCase().includes(kwMap.keyword.toLowerCase())) {
-            const x = Math.round(templateX + item.transform[4] * scaleX);
-            const y = Math.round(
-              templateY + (viewport.height - item.transform[5]) * scaleY
-            );
+    if (page.Texts) {
+      for (const textItem of page.Texts) {
+        for (const textRun of textItem.R) {
+          const text = decodeURIComponent(textRun.T).trim();
 
-            results.push({
-              field: kwMap.field,
-              x,
-              y,
-              width: Math.round(item.width * scaleX),
-              height: Math.round(item.height * scaleY),
-              matchText: text,
-            });
-            break;
+          if (text.length === 0) continue;
+
+          for (const kwMap of this.keywords) {
+            if (text.toLowerCase().includes(kwMap.keyword.toLowerCase())) {
+              const x = Math.round(templateX + textItem.x * scaleX);
+              const y = Math.round(templateY + textItem.y * scaleY);
+
+              const width = Math.round(textItem.w * scaleX);
+              const height = Math.round(
+                textRun.TS ? textRun.TS[1] * scaleY : 12 * scaleY
+              );
+
+              results.push({
+                field: kwMap.field,
+                x,
+                y,
+                width,
+                height,
+                matchText: text,
+              });
+              break;
+            }
           }
         }
       }
@@ -117,37 +127,29 @@ class PDFCoordinatesExtractor {
     templateWidth: number = 210,
     templateHeight?: number
   ): Promise<Array<{ text: string; x: number; y: number }>> {
-    const pdfjsLib = await this.loadPDFJS();
-    const dataBuffer = fs.readFileSync(pdfPath);
+    const pdfData = await this.parsePDF(pdfPath);
 
-    const loadTask = pdfjsLib.getDocument({
-      data: new Uint8Array(dataBuffer),
-      cMapUrl: "./node_modules/pdfjs-dist/cmaps/",
-      cMapPacked: true,
-      standardFontDataUrl: "./node_modules/pdfjs-dist/standard_fonts/",
-    });
+    if (!pdfData.Pages || pdfData.Pages.length === 0) {
+      throw new Error("No pages found in PDF");
+    }
 
-    const pdf = await loadTask.promise;
-    const page = await pdf.getPage(1);
-
-    const viewport = page.getViewport({ scale: 1.0 });
-
-    const scaleX = templateWidth / viewport.width;
-    const scaleY = templateHeight ? templateHeight / viewport.height : scaleX;
-
-    const textContent = await page.getTextContent();
+    const page = pdfData.Pages[0];
     const allText: Array<{ text: string; x: number; y: number }> = [];
 
-    for (const item of textContent.items) {
-      if ("str" in item) {
-        const text = item.str.trim();
-        if (text.length > 0) {
-          const x = Math.round(templateX + item.transform[4] * scaleX);
-          const y = Math.round(
-            templateY + (viewport.height - item.transform[5]) * scaleY
-          );
+    const scaleX = templateWidth / page.Width;
+    const scaleY = templateHeight ? templateHeight / page.Height : scaleX;
 
-          allText.push({ text, x, y });
+    if (page.Texts) {
+      for (const textItem of page.Texts) {
+        for (const textRun of textItem.R) {
+          const text = decodeURIComponent(textRun.T).trim();
+
+          if (text.length > 0) {
+            const x = Math.round(templateX + textItem.x * scaleX);
+            const y = Math.round(templateY + textItem.y * scaleY);
+
+            allText.push({ text, x, y });
+          }
         }
       }
     }
@@ -166,13 +168,13 @@ class PDFCoordinatesExtractor {
           matchText: coord.matchText,
         };
         return acc;
-      }, {} as JSONResult),
+      }, {} as Record<string, JSONResult>),
     };
 
     return JSON.stringify(output, null, 2);
   }
 
-  generateArray(coordinates: CoordinateResult[]) {
+  generateArray(coordinates: CoordinateResult[]): Record<string, JSONResult> {
     return coordinates.reduce((acc, coord) => {
       acc[coord.field] = {
         x: coord.x,
@@ -182,7 +184,7 @@ class PDFCoordinatesExtractor {
         matchText: coord.matchText,
       };
       return acc;
-    }, {} as CoordinateResult);
+    }, {} as Record<string, JSONResult>);
   }
 }
 
@@ -215,7 +217,7 @@ program
   .option("-f, --format <type>", "Output format (json|array)", "json")
   .action(async (pdfFile: string, options) => {
     try {
-      if (!fs.existsSync(pdfFile)) {
+      if (!existsSync(pdfFile)) {
         console.error(`PDF file not found: ${pdfFile}`);
         process.exit(1);
       }
@@ -223,7 +225,7 @@ program
       const extractor = new PDFCoordinatesExtractor();
 
       try {
-        extractor.laodKeywords(options.keywords);
+        await extractor.loadKeywords(options.keywords);
       } catch (error: any) {
         console.error(`Error loading keywords: ${error.message}`);
         process.exit(1);
@@ -252,6 +254,7 @@ program
       );
 
       if (coordinates.length === 0) {
+        console.log("No matching keywords found.");
         process.exit(1);
       }
 
@@ -263,11 +266,11 @@ program
       });
 
       if (options.format === "array") {
-        console.log("\nArray:");
+        console.log("\nPHP Array:");
         console.log("return [");
         coordinates.forEach((coord) => {
           console.log(
-            `'${coord.field}' => ['x' => ${coord.x}, 'y' => ${coord.y}, 'width' => ${coord.width}, 'height' => ${coord.height}], // ${coord.matchText}`
+            `    '${coord.field}' => ['x' => ${coord.x}, 'y' => ${coord.y}, 'width' => ${coord.width}, 'height' => ${coord.height}], // ${coord.matchText}`
           );
         });
         console.log("];");
@@ -289,7 +292,7 @@ program
           output = extractor.generateJSON(coordinates);
         }
 
-        fs.writeFileSync(options.output, output);
+        writeFileSync(options.output, output);
         console.log(`\nSaved to: ${options.output}`);
       }
     } catch (error: any) {
@@ -347,6 +350,8 @@ program
           templateHeight ? `, height=${templateHeight}` : ""
         }`
       );
+      console.log(`Total text items: ${filteredText.length}\n`);
+
       filteredText.forEach((item) => {
         console.log(`x=${item.x}, y=${item.y}: "${item.text}"`);
       });
@@ -379,7 +384,7 @@ program
         ],
       };
 
-      fs.writeFileSync(options.create, JSON.stringify(sampleKeywords, null, 2));
+      writeFileSync(options.create, JSON.stringify(sampleKeywords, null, 2));
       console.log(`Created sample keywords file: ${options.create}`);
       console.log("Edit this file to add the actual text labels from your PDF");
     }
