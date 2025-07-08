@@ -8,7 +8,17 @@ interface CoordinateResult {
   y: number;
   width: number;
   height: number;
-  matchedText: string;
+  matchText: string;
+  [key: string]: string | number | object;
+}
+
+interface JSONResult {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  matchText: string;
+  [key: string]: string | number | object;
 }
 
 interface KeywordPattern {
@@ -56,8 +66,9 @@ class PDFCoordinatesExtractor {
 
     const loadTask = pdfjsLib.getDocument({
       data: new Uint8Array(dataBuffer),
-      cMapUrl: "./node_modules/pdfjs-dist/camps/",
+      cMapUrl: "./node_modules/pdfjs-dist/cmaps/",
       cMapPacked: true,
+      standardFontDataUrl: "./node_modules/pdfjs-dist/standard_fonts/",
     });
 
     const pdf = await loadTask.promise;
@@ -66,7 +77,7 @@ class PDFCoordinatesExtractor {
     const viewport = pdfPage.getViewport({ scale: 1.0 });
 
     const scaleX = templateWidth / viewport.width;
-    const scaleY = (templateHeight as number) / viewport.height;
+    const scaleY = templateHeight ? templateHeight / viewport.height : scaleX;
 
     const textContent = await pdfPage.getTextContent();
     const results: CoordinateResult[] = [];
@@ -88,7 +99,7 @@ class PDFCoordinatesExtractor {
               y,
               width: Math.round(item.width * scaleX),
               height: Math.round(item.height * scaleY),
-              matchedText: text,
+              matchText: text,
             });
             break;
           }
@@ -113,6 +124,7 @@ class PDFCoordinatesExtractor {
       data: new Uint8Array(dataBuffer),
       cMapUrl: "./node_modules/pdfjs-dist/cmaps/",
       cMapPacked: true,
+      standardFontDataUrl: "./node_modules/pdfjs-dist/standard_fonts/",
     });
 
     const pdf = await loadTask.promise;
@@ -145,20 +157,32 @@ class PDFCoordinatesExtractor {
 
   generateJSON(coordinates: CoordinateResult[]): string {
     const output = {
-      generated_at: new Date().toLocaleDateString(),
       coordinates: coordinates.reduce((acc, coord) => {
         acc[coord.field] = {
           x: coord.x,
           y: coord.y,
           width: coord.width,
           height: coord.height,
-          matchText: coord.matchedText,
+          matchText: coord.matchText,
         };
         return acc;
-      }, {} as Record<string, object>),
+      }, {} as JSONResult),
     };
 
     return JSON.stringify(output, null, 2);
+  }
+
+  generateArray(coordinates: CoordinateResult[]) {
+    return coordinates.reduce((acc, coord) => {
+      acc[coord.field] = {
+        x: coord.x,
+        y: coord.y,
+        width: coord.width,
+        height: coord.height,
+        matchText: coord.matchText,
+      };
+      return acc;
+    }, {} as CoordinateResult);
   }
 }
 
@@ -188,7 +212,7 @@ program
     "Template height (optional, auto-calculated if not provided)"
   )
   .option("-o, --output <file>", "Save output to file (optional)")
-  .option("-f, --format <type>", "Output format (json|php)", "json")
+  .option("-f, --format <type>", "Output format (json|array)", "json")
   .action(async (pdfFile: string, options) => {
     try {
       if (!fs.existsSync(pdfFile)) {
@@ -234,21 +258,36 @@ program
       console.log("\nFound coordinates:");
       coordinates.forEach((coord) => {
         console.log(
-          `${coord.field}: x=${coord.x}, y=${coord.y} (found: "${coord.matchedText}")`
+          `${coord.field}: x=${coord.x}, y=${coord.y} (match: "${coord.matchText}")`
         );
       });
 
-      console.log("\nPHP Array:");
-      console.log("return [");
-      coordinates.forEach((coord) => {
-        console.log(
-          `    '${coord.field}' => ['x' => ${coord.x}, 'y' => ${coord.y}], // ${coord.matchedText}`
-        );
-      });
-      console.log("];");
+      if (options.format === "array") {
+        console.log("\nArray:");
+        console.log("return [");
+        coordinates.forEach((coord) => {
+          console.log(
+            `'${coord.field}' => ['x' => ${coord.x}, 'y' => ${coord.y}, 'width' => ${coord.width}, 'height' => ${coord.height}], // ${coord.matchText}`
+          );
+        });
+        console.log("];");
+      } else {
+        console.log("\nJSON:");
+        console.log(extractor.generateJSON(coordinates));
+      }
 
       if (options.output) {
-        let output = extractor.generateJSON(coordinates);
+        let output;
+
+        if (options.format === "array") {
+          output = JSON.stringify(
+            extractor.generateArray(coordinates),
+            null,
+            2
+          );
+        } else {
+          output = extractor.generateJSON(coordinates);
+        }
 
         fs.writeFileSync(options.output, output);
         console.log(`\nSaved to: ${options.output}`);
@@ -295,6 +334,7 @@ program
       );
 
       let filteredText = allText;
+
       if (options.filter) {
         filteredText = allText.filter((item) =>
           item.text.toLowerCase().includes(options.filter.toLowerCase())
@@ -327,17 +367,14 @@ program
           {
             field: "company_name_label",
             keyword: "Company Name",
-            description: "Label for company name field",
           },
           {
             field: "total_amount_label",
             keyword: "Total Amount",
-            description: "Label for total amount field",
           },
           {
             field: "date_label",
             keyword: "Date",
-            description: "Label for date field",
           },
         ],
       };
